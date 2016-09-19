@@ -9,23 +9,23 @@
 import Foundation
 import Starscream
 fileprivate func < <T : Comparable>(lhs: T?, rhs: T?) -> Bool {
-  switch (lhs, rhs) {
-  case let (l?, r?):
-    return l < r
-  case (nil, _?):
-    return true
-  default:
-    return false
-  }
+    switch (lhs, rhs) {
+    case let (l?, r?):
+        return l < r
+    case (nil, _?):
+        return true
+    default:
+        return false
+    }
 }
 
 fileprivate func >= <T : Comparable>(lhs: T?, rhs: T?) -> Bool {
-  switch (lhs, rhs) {
-  case let (l?, r?):
-    return l >= r
-  default:
-    return !(lhs < rhs)
-  }
+    switch (lhs, rhs) {
+    case let (l?, r?):
+        return l >= r
+    default:
+        return !(lhs < rhs)
+    }
 }
 
 
@@ -598,13 +598,13 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - return: TRUE if the authentication was successful or FALSE if it was not.
      */
     open func saveAuthentication(_ aUrl:String,
-                                   isCluster:Bool,
-                                   authenticationToken:String,
-                                   authenticationTokenIsPrivate:Bool,
-                                   applicationKey:String,
-                                   timeToLive:Int,
-                                   privateKey:String,
-                                   permissions:NSMutableDictionary?)->Bool{
+                                 isCluster:Bool,
+                                 authenticationToken:String,
+                                 authenticationTokenIsPrivate:Bool,
+                                 applicationKey:String,
+                                 timeToLive:Int,
+                                 privateKey:String,
+                                 permissions:NSMutableDictionary?)->Bool{
         /*
          * Sanity Checks.
          */
@@ -676,11 +676,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - parameter callback: Callback with error (NSError) and result (NSString) parameters
      */
     open func enablePresence(_ aUrl:String, isCluster:Bool,
-                               applicationKey:String,
-                               privateKey:String,
-                               channel:String,
-                               metadata:Bool,
-                               callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
+                             applicationKey:String,
+                             privateKey:String,
+                             channel:String,
+                             metadata:Bool,
+                             callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
         self.setPresence(true, aUrl: aUrl, isCluster: isCluster, applicationKey: applicationKey, privateKey: privateKey, channel: channel, metadata: metadata, callback: callback)
     }
     
@@ -695,11 +695,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - parameter callback: Callback with error (NSError) and result (NSString) parameters
      */
     open func disablePresence(_ aUrl:String,
-                                isCluster:Bool,
-                                applicationKey:String,
-                                privateKey:String,
-                                channel:String,
-                                callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
+                              isCluster:Bool,
+                              applicationKey:String,
+                              privateKey:String,
+                              channel:String,
+                              callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
         self.setPresence(false, aUrl: aUrl, isCluster: isCluster, applicationKey: applicationKey, privateKey: privateKey, channel: channel, metadata: false, callback: callback)
     }
     
@@ -768,11 +768,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      * - parameter callback: Callback with error (NSError) and result (NSDictionary) parameters
      */
     open func presence(_ aUrl:String,
-                         isCluster:Bool,
-                         applicationKey:String,
-                         authenticationToken:String,
-                         channel:String,
-                         callback:@escaping (_ error:NSError?, _ result:NSDictionary?)->Void){
+                       isCluster:Bool,
+                       applicationKey:String,
+                       authenticationToken:String,
+                       channel:String,
+                       callback:@escaping (_ error:NSError?, _ result:NSDictionary?)->Void){
         /*
          * Sanity Checks.
          */
@@ -1068,7 +1068,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     func processConnect(_ sender: AnyObject) {
         if stopReconnecting == false {
             balancer = (Balancer(cluster: self.clusterUrl as? String, serverUrl: self.url as? String, isCluster: self.isCluster!, appKey: self.applicationKey!,
-                callback:
+                                 callback:
                 { (aBalancerResponse: String?) in
                     
                     if self.isCluster != nil {
@@ -1809,7 +1809,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     }
     
     
-    public func websocketDidConnect(_ socket: WebSocket){
+    public func websocketDidConnect(socket: WebSocket){
         self.timer?.invalidate()
         if self.isEmpty(self.readLocalStorage(SESSION_STORAGE_NAME + applicationKey!) as AnyObject?) {
             sessionId = self.generateId(16) as NSString?
@@ -1824,7 +1824,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
         self.webSocket!.write(string:aString, completion: nil)
     }
     
-    public func websocketDidDisconnect(_ socket: WebSocket, error: NSError?){
+    public func websocketDidDisconnect(socket: WebSocket, error: NSError?){
         isConnecting = false
         // Reconnect
         if stopReconnecting == false {
@@ -1855,11 +1855,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
         }
     }
     
-    public func websocketDidReceiveMessage(_ socket: WebSocket, text: String){
+    public func websocketDidReceiveMessage(socket: WebSocket, text: String){
         self.parseReceivedMessage(text as NSString?)
     }
     
-    public func websocketDidReceiveData(_ socket: WebSocket, data: Data){
+    public func websocketDidReceiveData(socket: WebSocket, data: Data){
         
     }
     
