@@ -9,14 +9,6 @@
 import Foundation
 import Starscream
 fileprivate func < <T : Comparable>(lhs: T?, rhs: T?) -> Bool {
-  switch (lhs, rhs) {
-  case let (l?, r?):
-    return l < r
-  case (nil, _?):
-    return true
-  default:
-    return false
-  }
     switch (lhs, rhs) {
     case let (l?, r?):
         return l < r
@@ -28,12 +20,6 @@ fileprivate func < <T : Comparable>(lhs: T?, rhs: T?) -> Bool {
 }
 
 fileprivate func >= <T : Comparable>(lhs: T?, rhs: T?) -> Bool {
-  switch (lhs, rhs) {
-  case let (l?, r?):
-    return l >= r
-  default:
-    return !(lhs < rhs)
-  }
     switch (lhs, rhs) {
     case let (l?, r?):
         return l >= r
@@ -612,13 +598,6 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - return: TRUE if the authentication was successful or FALSE if it was not.
      */
     open func saveAuthentication(_ aUrl:String,
-                                   isCluster:Bool,
-                                   authenticationToken:String,
-                                   authenticationTokenIsPrivate:Bool,
-                                   applicationKey:String,
-                                   timeToLive:Int,
-                                   privateKey:String,
-                                   permissions:NSMutableDictionary?)->Bool{
                                  isCluster:Bool,
                                  authenticationToken:String,
                                  authenticationTokenIsPrivate:Bool,
@@ -697,11 +676,6 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - parameter callback: Callback with error (NSError) and result (NSString) parameters
      */
     open func enablePresence(_ aUrl:String, isCluster:Bool,
-                               applicationKey:String,
-                               privateKey:String,
-                               channel:String,
-                               metadata:Bool,
-                               callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
                              applicationKey:String,
                              privateKey:String,
                              channel:String,
@@ -721,11 +695,6 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - parameter callback: Callback with error (NSError) and result (NSString) parameters
      */
     open func disablePresence(_ aUrl:String,
-                                isCluster:Bool,
-                                applicationKey:String,
-                                privateKey:String,
-                                channel:String,
-                                callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
                               isCluster:Bool,
                               applicationKey:String,
                               privateKey:String,
@@ -799,11 +768,6 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      * - parameter callback: Callback with error (NSError) and result (NSDictionary) parameters
      */
     open func presence(_ aUrl:String,
-                         isCluster:Bool,
-                         applicationKey:String,
-                         authenticationToken:String,
-                         channel:String,
-                         callback:@escaping (_ error:NSError?, _ result:NSDictionary?)->Void){
                        isCluster:Bool,
                        applicationKey:String,
                        authenticationToken:String,
@@ -1104,7 +1068,6 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     func processConnect(_ sender: AnyObject) {
         if stopReconnecting == false {
             balancer = (Balancer(cluster: self.clusterUrl as? String, serverUrl: self.url as? String, isCluster: self.isCluster!, appKey: self.applicationKey!,
-                callback:
                                  callback:
                 { (aBalancerResponse: String?) in
                     
