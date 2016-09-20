@@ -9,23 +9,23 @@
 import Foundation
 import Starscream
 fileprivate func < <T : Comparable>(lhs: T?, rhs: T?) -> Bool {
-    switch (lhs, rhs) {
-    case let (l?, r?):
-        return l < r
-    case (nil, _?):
-        return true
-    default:
-        return false
-    }
+  switch (lhs, rhs) {
+  case let (l?, r?):
+    return l < r
+  case (nil, _?):
+    return true
+  default:
+    return false
+  }
 }
 
 fileprivate func >= <T : Comparable>(lhs: T?, rhs: T?) -> Bool {
-    switch (lhs, rhs) {
-    case let (l?, r?):
-        return l >= r
-    default:
-        return !(lhs < rhs)
-    }
+  switch (lhs, rhs) {
+  case let (l?, r?):
+    return l >= r
+  default:
+    return !(lhs < rhs)
+  }
 }
 
 
@@ -598,13 +598,13 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - return: TRUE if the authentication was successful or FALSE if it was not.
      */
     open func saveAuthentication(_ aUrl:String,
-                                 isCluster:Bool,
-                                 authenticationToken:String,
-                                 authenticationTokenIsPrivate:Bool,
-                                 applicationKey:String,
-                                 timeToLive:Int,
-                                 privateKey:String,
-                                 permissions:NSMutableDictionary?)->Bool{
+                                   isCluster:Bool,
+                                   authenticationToken:String,
+                                   authenticationTokenIsPrivate:Bool,
+                                   applicationKey:String,
+                                   timeToLive:Int,
+                                   privateKey:String,
+                                   permissions:NSMutableDictionary?)->Bool{
         /*
          * Sanity Checks.
          */
@@ -655,7 +655,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                     semaphore.signal()
                 }
                 task.resume()
-                semaphore.wait(timeout: DispatchTime.distantFuture)
+                _ = semaphore.wait(timeout: DispatchTime.distantFuture)
             } else {
                 NSException(name: NSExceptionName(rawValue: "Get Cluster URL"), reason: "Unable to get URL from cluster", userInfo: nil).raise()
             }
@@ -676,11 +676,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - parameter callback: Callback with error (NSError) and result (NSString) parameters
      */
     open func enablePresence(_ aUrl:String, isCluster:Bool,
-                             applicationKey:String,
-                             privateKey:String,
-                             channel:String,
-                             metadata:Bool,
-                             callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
+                               applicationKey:String,
+                               privateKey:String,
+                               channel:String,
+                               metadata:Bool,
+                               callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
         self.setPresence(true, aUrl: aUrl, isCluster: isCluster, applicationKey: applicationKey, privateKey: privateKey, channel: channel, metadata: metadata, callback: callback)
     }
     
@@ -695,11 +695,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - parameter callback: Callback with error (NSError) and result (NSString) parameters
      */
     open func disablePresence(_ aUrl:String,
-                              isCluster:Bool,
-                              applicationKey:String,
-                              privateKey:String,
-                              channel:String,
-                              callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
+                                isCluster:Bool,
+                                applicationKey:String,
+                                privateKey:String,
+                                channel:String,
+                                callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
         self.setPresence(false, aUrl: aUrl, isCluster: isCluster, applicationKey: applicationKey, privateKey: privateKey, channel: channel, metadata: false, callback: callback)
     }
     
@@ -720,12 +720,12 @@ open class OrtcClient: NSObject, WebSocketDelegate {
         } else if !self.ortcIsValidInput(channel) {
             NSException(name: NSExceptionName(rawValue: "Channel"), reason: "Channel has invalid characters", userInfo: nil).raise()
         } else {
-            var connectionUrl: String = aUrl
+            var connectionUrl: String? = aUrl
             if isCluster {
                 connectionUrl = String(describing: self.getClusterServer(true, aPostUrl: aUrl)!)
             }
             if connectionUrl != nil {
-                connectionUrl = connectionUrl.hasSuffix("/") ? connectionUrl : connectionUrl + "/"
+                connectionUrl = connectionUrl!.hasSuffix("/") ? connectionUrl! : connectionUrl! + "/"
                 var path: String = ""
                 var content: String = ""
                 
@@ -737,11 +737,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                     content = "privatekey=\(privateKey)"
                 }
                 
-                connectionUrl = connectionUrl + path
+                connectionUrl = connectionUrl! + path
                 let postData: Data = (content as NSString).data(using: String.Encoding.utf8.rawValue, allowLossyConversion: true)!
                 let postLength: String = "\(CUnsignedLong((postData as Data).count))"
                 let request: NSMutableURLRequest = NSMutableURLRequest()
-                request.url = URL(string: connectionUrl)
+                request.url = URL(string: connectionUrl!)
                 request.httpMethod = "POST"
                 request.setValue(postLength, forHTTPHeaderField: "Content-Length")
                 request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -768,11 +768,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      * - parameter callback: Callback with error (NSError) and result (NSDictionary) parameters
      */
     open func presence(_ aUrl:String,
-                       isCluster:Bool,
-                       applicationKey:String,
-                       authenticationToken:String,
-                       channel:String,
-                       callback:@escaping (_ error:NSError?, _ result:NSDictionary?)->Void){
+                         isCluster:Bool,
+                         applicationKey:String,
+                         authenticationToken:String,
+                         channel:String,
+                         callback:@escaping (_ error:NSError?, _ result:NSDictionary?)->Void){
         /*
          * Sanity Checks.
          */
@@ -787,16 +787,16 @@ open class OrtcClient: NSObject, WebSocketDelegate {
         } else if !self.ortcIsValidInput(channel) {
             NSException(name: NSExceptionName(rawValue: "Channel"), reason: "Channel has invalid characters", userInfo: nil).raise()
         } else {
-            var connectionUrl: String = aUrl
+            var connectionUrl: String? = aUrl
             if isCluster {
                 connectionUrl = String(describing: self.getClusterServer(true, aPostUrl: aUrl)!)
             }
             if connectionUrl != nil {
-                connectionUrl = connectionUrl.hasSuffix("/") ? connectionUrl : "\(connectionUrl)/"
+                connectionUrl = connectionUrl!.hasSuffix("/") ? connectionUrl! : "\(connectionUrl!)/"
                 let path: String = "presence/\(applicationKey)/\(authenticationToken)/\(channel)"
-                connectionUrl = "\(connectionUrl)\(path)"
-                var request: NSMutableURLRequest = NSMutableURLRequest()
-                request.url = URL(string: connectionUrl)
+                connectionUrl = "\(connectionUrl!)\(path)"
+                let request: NSMutableURLRequest = NSMutableURLRequest()
+                request.url = URL(string: connectionUrl!)
                 request.httpMethod = "GET"
                 request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
                 let pr:PresenceRequest = PresenceRequest()
@@ -989,7 +989,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     func generateError(_ errText: String) -> NSError {
         let errorDetail: NSMutableDictionary = NSMutableDictionary()
         errorDetail.setValue(errText, forKey: NSLocalizedDescriptionKey)
-        return NSError(domain: "OrtcClient", code: 1, userInfo: errorDetail as NSDictionary as! [AnyHashable: Any])
+        return NSError(domain: "OrtcClient", code: 1, userInfo: ((errorDetail as NSDictionary) as! [AnyHashable: Any]))
     }
     
     func doConnect(_ sender: AnyObject) {
@@ -1068,7 +1068,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     func processConnect(_ sender: AnyObject) {
         if stopReconnecting == false {
             balancer = (Balancer(cluster: self.clusterUrl as? String, serverUrl: self.url as? String, isCluster: self.isCluster!, appKey: self.applicationKey!,
-                                 callback:
+                callback:
                 { (aBalancerResponse: String?) in
                     
                     if self.isCluster != nil {
@@ -1187,7 +1187,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                 if plistPath != nil
                 {
                     let plistXML: Data?
-                    plistXML = try FileManager.default.contents(atPath: plistPath!)
+                    plistXML = FileManager.default.contents(atPath: plistPath!)
                     
                     if plistXML != nil{
                         plistProps = try (PropertyListSerialization.propertyList(from: plistXML!, options: PropertyListSerialization.MutabilityOptions.mutableContainersAndLeaves, format: format) as? NSDictionary)
@@ -1221,7 +1221,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
             result = res
             semaphore.signal()
         })
-        semaphore.wait(timeout: DispatchTime.distantFuture)
+        _ = semaphore.wait(timeout: DispatchTime.distantFuture)
         return result
     }
     
@@ -1594,7 +1594,6 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                         }
                     }
                     
-                    var t:AnyObject? = messagesBuffer?.object(forKey: messageId) as AnyObject!
                     if messagesBuffer?.object(forKey: messageId) != nil &&
                         ((messagesBuffer?.object(forKey: messageId) as! NSDictionary).object(forKey: "isMsgSent") as! Bool) == true {
                         messagesBuffer?.removeObject(forKey: messageId)
@@ -1721,7 +1720,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                 let next = str.character(at:i + 1)
                 
                 if next == ("u" as NSString).character(at: 0) {
-                    var size = ((i - 1) + 12)
+                    let size = ((i - 1) + 12)
                     if (size < len && str.character(at: i + 6) == ("u" as NSString).character(at: 0)){
                         var emoji: NSString? = str.substring(with: NSMakeRange((i), 12)) as NSString?
                         let pos: Data? = emoji?.data(using: String.Encoding.utf8.rawValue)
@@ -1819,8 +1818,13 @@ open class OrtcClient: NSObject, WebSocketDelegate {
         if heartbeatActive == true{
             hbDetails = ";\(heartbeatTime!);\(heartbeatFails!);"
         }
+        
+        if connectionMetadata != nil {
+            connectionMetadata = connectionMetadata!.replacingOccurrences(of: "\"", with: "\\\"") as NSString?
+        }
+        
         // Send validate
-        let aString: String = "\"validate;\(applicationKey!);\(authenticationToken!);\(announcementSubChannel != nil ? announcementSubChannel! : "");\(sessionId != nil ? sessionId! : "");\(connectionMetadata != nil ? connectionMetadata! : "")\(hbDetails)\""
+        let aString: String = "\"validate;\(applicationKey!);\(authenticationToken!);\(announcementSubChannel != nil ? announcementSubChannel! : "");\(sessionId != nil ? sessionId! : "");\(connectionMetadata != nil ? "\(connectionMetadata!)" : "")\(hbDetails)\""
         self.webSocket!.write(string:aString, completion: nil)
     }
     
@@ -1972,7 +1976,7 @@ class PresenceRequest: NSObject {
                     if dataStr!.caseInsensitiveCompare("null") != ComparisonResult.orderedSame {
                         let errorDetail: NSMutableDictionary = NSMutableDictionary()
                         errorDetail.setObject(dataStr!, forKey: NSLocalizedDescriptionKey as NSCopying)
-                        let error: NSError = NSError(domain:"OrtcClient", code: 1, userInfo: errorDetail as NSDictionary as! [AnyHashable: Any])
+                        let error: NSError = NSError(domain:"OrtcClient", code: 1, userInfo: ((errorDetail as NSDictionary) as! [AnyHashable: Any]))
                         self.callbackDictionary!(error, nil)
                     }
                     else {
