@@ -1819,12 +1819,14 @@ open class OrtcClient: NSObject, WebSocketDelegate {
             hbDetails = ";\(heartbeatTime!);\(heartbeatFails!);"
         }
         
+        var tempMetaData:NSString?
         if connectionMetadata != nil {
-            connectionMetadata = connectionMetadata!.replacingOccurrences(of: "\"", with: "\\\"") as NSString?
+            tempMetaData = connectionMetadata!.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") as NSString?
         }
         
         // Send validate
-        let aString: String = "\"validate;\(applicationKey!);\(authenticationToken!);\(announcementSubChannel != nil ? announcementSubChannel! : "");\(sessionId != nil ? sessionId! : "");\(connectionMetadata != nil ? "\(connectionMetadata!)" : "")\(hbDetails)\""
+        let aString: String = "\"validate;\(applicationKey!);\(authenticationToken!);\(announcementSubChannel != nil ? announcementSubChannel! : "");\(sessionId != nil ? sessionId! : "");\(tempMetaData != nil ? "\(tempMetaData!)" : "")\(hbDetails)\""
+        
         self.webSocket!.write(string:aString, completion: nil)
     }
     
