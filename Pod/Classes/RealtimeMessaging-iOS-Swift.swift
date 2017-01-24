@@ -7,25 +7,27 @@
 //
 
 import Foundation
+import UIKit
 import Starscream
+
 fileprivate func < <T : Comparable>(lhs: T?, rhs: T?) -> Bool {
-  switch (lhs, rhs) {
-  case let (l?, r?):
-    return l < r
-  case (nil, _?):
-    return true
-  default:
-    return false
-  }
+    switch (lhs, rhs) {
+    case let (l?, r?):
+        return l < r
+    case (nil, _?):
+        return true
+    default:
+        return false
+    }
 }
 
 fileprivate func >= <T : Comparable>(lhs: T?, rhs: T?) -> Bool {
-  switch (lhs, rhs) {
-  case let (l?, r?):
-    return l >= r
-  default:
-    return !(lhs < rhs)
-  }
+    switch (lhs, rhs) {
+    case let (l?, r?):
+        return l >= r
+    default:
+        return !(lhs < rhs)
+    }
 }
 
 
@@ -168,6 +170,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
         case opSubscribe
         case opUnsubscribe
         case opException
+        case opAck
     }
     
     enum errCodes : Int {
@@ -178,6 +181,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
         case errSendMaxSize
     }
     
+    let JSON_PATTERN: String = "^a\\[\"(.*?)\"\\]$"
     let OPERATION_PATTERN: String = "^a\\[\"\\{\\\\\"op\\\\\":\\\\\"(.*?[^\"]+)\\\\\",(.*?)\\}\"\\]$"
     let VALIDATED_PATTERN: String = "^(\\\\\"up\\\\\":){1}(.*?)(,\\\\\"set\\\\\":(.*?))?$"
     let CHANNEL_PATTERN: String = "^\\\\\"ch\\\\\":\\\\\"(.*?)\\\\\"$"
@@ -195,6 +199,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     var webSocket: WebSocket?
     var ortcDelegate: OrtcClientDelegate?
     var subscribedChannels: NSMutableDictionary?
+    var pendingPublishMessages: NSMutableDictionary?
     var permissions: NSMutableDictionary?
     var messagesBuffer: NSMutableDictionary?
     var opCases: NSMutableDictionary?
@@ -232,7 +237,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     var announcementSubChannel: NSString?
     var sessionId: NSString?
     var connectionTimeout: Int32?
+    var publishTimeout: Double?
+    var partsSentInterval:Timer?
     /**Client connection state*/
+    
+    var sema = DispatchSemaphore(value: 0)
     open var isConnected: Bool?
     
     //MARK: Public methods
@@ -257,6 +266,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
             opCases!["ortc-subscribed"] = NSNumber(value: opCodes.opSubscribe.rawValue as Int)
             opCases!["ortc-unsubscribed"] = NSNumber(value: opCodes.opUnsubscribe.rawValue as Int)
             opCases!["ortc-error"] = NSNumber(value: opCodes.opException.rawValue as Int)
+            opCases!["ortc-ack"] = NSNumber(value: opCodes.opAck.rawValue as Int)
         }
         if errCases == nil {
             errCases = NSMutableDictionary(capacity: 5)
@@ -269,6 +279,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
         //apply properties
         self.ortcDelegate = delegate
         connectionTimeout = 5
+        publishTimeout = 5
         // seconds
         sessionExpirationTime = 30
         // minutes
@@ -326,7 +337,6 @@ open class OrtcClient: NSObject, WebSocketDelegate {
             self.isReconnecting = false
             self.stopReconnecting = false
             self.doConnect(self)
-            
         }
     }
     
@@ -352,12 +362,156 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     }
     
     /**
+     * Publish a message to a channel.
+     *
+     * - parameter channel: The channel name.
+     * - parameter message: The message to publish.
+     * - parameter ttl: The message expiration time in seconds (0 for maximum allowed ttl).
+     * - parameter callback: Returns error if message publish was not successful or published message unique id (seqId) if sucessfully published
+     */
+    open func publish(_ channel:NSString, message:NSString, ttl:NSNumber, callback:@escaping (_ error:NSError?,_ seqId:NSString?)->Void){
+        var message = message
+        if self.isConnected == false {
+            self.delegateExceptionCallback(self, error: self.generateError("Not connected"))
+        } else if self.isEmpty(channel) {
+            self.delegateExceptionCallback(self, error: self.generateError("Channel is null or empty"))
+        } else if !self.ortcIsValidInput(channel as String) {
+            self.delegateExceptionCallback(self, error: self.generateError("Channel has invalid characters"))
+        } else if self.isEmpty(message) {
+            self.delegateExceptionCallback(self, error: self.generateError("Message is null or empty"))
+        } else {
+            message = message.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\n", with: "\\n") as NSString
+            message = message.replacingOccurrences(of: "\"", with: "\\\"") as NSString
+            let channelBytes: Data = channel.data(using: String.Encoding.utf8.rawValue)!
+            if channelBytes.count >= MAX_CHANNEL_SIZE {
+                self.delegateExceptionCallback(self, error: self.generateError("Channel size exceeds the limit of \(MAX_CHANNEL_SIZE) characters"))
+            } else {
+                let domainChannelIndex: Int = channel.range(of: ":").location
+                var channelToValidate: NSString = channel
+                var hashPerm: String?
+                if domainChannelIndex != NSNotFound {
+                    channelToValidate = (channel as NSString).substring(to: domainChannelIndex + 1) as NSString
+                    channelToValidate = "\(channelToValidate)*" as NSString
+                }
+                if self.permissions != nil {
+                    if self.permissions![channelToValidate] != nil {
+                        hashPerm = self.permissions!.object(forKey: channelToValidate) as? String
+                    } else{
+                        hashPerm = self.permissions!.object(forKey: channel) as? String
+                    }
+                }
+                if self.permissions != nil && hashPerm == nil {
+                    self.delegateExceptionCallback(self, error: self.generateError("No permission found to send to the channel '\(channel)'"))
+                } else {
+                    let messageBytes: Data = Data(bytes:(message.utf8String!), count: message.lengthOfBytes(using: String.Encoding.utf8.rawValue))
+                    let messageParts: NSMutableArray = NSMutableArray()
+                    var pos: Int = 0
+                    var remaining: Int
+                    let messageId: String = self.generateId(8)
+                    
+                    
+                    while (UInt(messageBytes.count - pos) > 0) {
+                        remaining = messageBytes.count - pos
+                        let arraySize: Int
+                        if remaining >= MAX_MESSAGE_SIZE-channelBytes.count {
+                            arraySize = MAX_MESSAGE_SIZE-channelBytes.count
+                        } else {
+                            arraySize = remaining
+                        }
+                        let messageBytesTemp = UnsafeRawPointer((messageBytes as NSData).bytes).assumingMemoryBound(to: UInt8.self)
+                        let messagePart = Array(UnsafeBufferPointer(start: UnsafePointer<UInt8>(messageBytesTemp) + pos, count: arraySize))
+                        let res:NSString? = NSString(bytes: messagePart, length: arraySize, encoding: String.Encoding.utf8.rawValue)
+                        if res != nil{
+                            messageParts.add(res!)
+                        }
+                        pos += arraySize
+                    }
+                    
+                    var err:String = ""
+                    
+                    if pendingPublishMessages == nil{
+                        pendingPublishMessages = NSMutableDictionary()
+                    }
+                    
+                    if((pendingPublishMessages?.object(forKey: messageId)) != nil){
+                        err = "Message id conflict. Please retry publishing the message";
+                    }
+                    else {
+                        DispatchQueue.main.async(execute: {
+                            var ackTimeout = Timer.scheduledTimer(timeInterval: Double(self.publishTimeout!), target: self, selector: #selector(self.ACKTimeout(_:)), userInfo: messageId, repeats: false)
+                            var pendingMsg = ["totalNumOfParts": messageParts.count,
+                                              "callback": callback,
+                                              "timeout": ackTimeout] as [String : Any]
+                            
+                            self.pendingPublishMessages?.setObject(pendingMsg, forKey: messageId as NSCopying)
+                        })
+                        
+                        
+                        
+                        if(messageParts.count < 20){
+                            var counter: Int32 = 1
+                            for messageToSend in messageParts {
+                                let encodedData: NSString = messageToSend as! NSString
+                                let aString: NSString = "\"publish;\(applicationKey!);\(authenticationToken!);\(channel);\(ttl);\(hashPerm);\(messageId)_\(counter)-\((Int32(messageParts.count)))_\(encodedData)\"" as NSString
+                                self.webSocket!.write(string:aString as String, completion:nil)
+                                counter += 1
+                            }
+                        }else{
+                            var counter:Int = 1
+                            var partsSent:Int = 0
+                            
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                while true{
+                                    if self.isConnected == true && self.webSocket != nil{
+                                        var currentPart:Int = partsSent;
+                                        var totalParts:Int = messageParts.count;
+                                        
+                                        let encodedData: NSString = messageParts.object(at: currentPart) as! NSString
+                                        let aString: NSString = "\"publish;\(self.applicationKey!);\(self.authenticationToken!);\(channel);\(ttl);\(hashPerm);\(messageId)_\(counter)-\((Int32(messageParts.count)))_\(encodedData)\"" as NSString
+                                        
+                                        self.webSocket!.write(string:aString as String, completion:nil)
+                                        partsSent += 1
+                                        
+                                        if partsSent == messageParts.count {
+                                            break
+                                        }
+                                        sleep(UInt32(0.1))
+                                    }else{
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    
+    
+    func ACKTimeout(_ timer: Timer){
+        let messageId = timer.userInfo as! String
+        var err:String = ""
+        if self.pendingPublishMessages?.object(forKey: messageId) != nil{
+            err = "Message publish timeout after \(self.publishTimeout) seconds"
+            if (self.pendingPublishMessages?.object(forKey: messageId) as! NSDictionary).object(forKey: "callback") != nil {
+                
+                let dictionary:NSDictionary = self.pendingPublishMessages?.object(forKey: messageId) as! NSDictionary
+                var callbackP: ((_ error:NSError?,_ seqId:NSString?)->Void) = dictionary.object(forKey: "callback") as! ((NSError?, NSString?) -> Void)
+                callbackP(self.generateError(err), nil)
+            }
+            self.pendingPublishMessages?.removeObject(forKey: messageId)
+        }
+    }
+    
+    /**
      * Sends a message to a channel.
      *
      * - parameter channel: The channel name.
      * - parameter message: The message to send.
      */
-    public func send(_ channel:NSString, message:NSString){
+    open func send(_ channel:NSString, message:NSString){
         var message = message
         if self.isConnected == false {
             self.delegateExceptionCallback(self, error: self.generateError("Not connected"))
@@ -421,13 +575,9 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                         self.webSocket?.write(string:aString as String, completion:nil)
                         counter += 1
                     }
-                    
                 }
-                
             }
-            
         }
-        
     }
     
     /**
@@ -440,6 +590,149 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     open func subscribe(_ channel:String, subscribeOnReconnected:Bool, onMessage:@escaping (_ ortc:OrtcClient, _ channel:String, _ message:String)->Void){
         self.subscribeChannel(channel, withNotifications: WITHOUT_NOTIFICATIONS, subscribeOnReconnect: subscribeOnReconnected, withFilter: false, filter: "", onMessage: onMessage, onMessageWithFilter: nil)
     }
+    
+    /**
+     * Subscribes to a channel to receive messages sent to it with given options.
+     *
+     * Options dictionary example:
+     *
+     *  ```swift
+     *        var options:[String : Any] = ["channel":channel,
+     *                                        "subscribeOnReconnected":true,
+     *                                        "subscriberId":subscriberId]
+     *
+     *        self.subscribeWithOptions(options as NSDictionary?) { (client, dictionary) in
+     *           //your code
+     *        }
+     *  ```
+     *
+     * - parameter options: The subscription options dictionary,<br>
+     *      <code>options = {<br>
+     * &nbsp;&nbsp;&nbsp;&nbsp; channel,<br>
+     * &nbsp;&nbsp;&nbsp;&nbsp; subscribeOnReconnected, // optional, default = true<br>
+     * &nbsp;&nbsp;&nbsp;&nbsp; regId, // optional, default = "", device token for push notifications as in                 subscribeWithNotifications<br>
+     * &nbsp;&nbsp;&nbsp;&nbsp; pushPlatform, // optional, default = "", push notifications platform as in  subscribeWithNotifications<br>
+     * &nbsp;&nbsp;&nbsp;&nbsp; filter, // optional, default = "", the subscription filter as in subscribeWithFilter<br>
+     * &nbsp;&nbsp;&nbsp;&nbsp; subscriberId // optional, default = "", the subscriberId as in subscribeWithBuffer<br>
+     *      }<br></code>
+     * - parameter onMessageWithOptionsCallback: The callback called when a message arrives at the channel, data is provided in a dictionary.
+     */
+    open func subscribeWithOptions(_ options:NSDictionary? ,onMessageWithOptionsCallback:@escaping (_ ortc:OrtcClient, _ msgOptions:NSDictionary)->Void){
+        if(options != nil) {
+            var subscribeOnReconnected:Bool? = options!.object(forKey: "subscribeOnReconnected") as? Bool
+            if subscribeOnReconnected == nil {
+                subscribeOnReconnected = true
+            }
+            self._subscribeOptions(channel: options!.object(forKey: "channel") as! String, subscribeOnReconnected: subscribeOnReconnected!, withNotifications: options!.object(forKey: "withNotifications") as? Bool, filter: options!.object(forKey: "filter") as? String, subscriberId: options!.object(forKey: "subscriberId") as? String, onMessageWithOptionsCallback: onMessageWithOptionsCallback)
+        } else {
+            self.delegateExceptionCallback(self, error: self.generateError("subscribeWithOptions called with no options"))
+        }
+    }
+    
+    /**
+     * Subscribes to a channel to receive messages published to it.
+     *
+     * - parameter channel: The channel name.
+     * - parameter subscriberId: The subscriberId associated to the channel.
+     * - parameter onMessageWithBufferCallback: The callback called when a message arrives at the channel and message seqId number.
+     */
+    open func subscribeWithBuffer(channel:String, subscriberId:String, onMessageWithBufferCallback:@escaping (_ ortc:OrtcClient, _ channel:String, _ seqId:String, _ message:String)->Void){
+        var options:[String : Any] = ["channel":channel,
+                                      "subscribeOnReconnected":true,
+                                      "subscriberId":subscriberId]
+        
+        self.subscribeWithOptions(options as NSDictionary?) { (client, dictionary) in
+            onMessageWithBufferCallback(client, dictionary.object(forKey: "channel") as! String,
+                                        dictionary.object(forKey: "seqId") as! String,
+                                        dictionary.object(forKey: "message") as! String)
+        }
+    }
+    
+    
+    
+    open func _subscribeOptions(channel:String, subscribeOnReconnected:Bool, withNotifications:Bool?, filter:String?, subscriberId:String?, onMessageWithOptionsCallback: @escaping (_ ortc:OrtcClient, _ msgOptions: NSDictionary)->Void){
+        if self.isConnected == false {
+            self.delegateExceptionCallback(self, error: self.generateError("Not connected"))
+        } else if self.isEmpty(channel as AnyObject?) {
+            self.delegateExceptionCallback(self, error: self.generateError("Channel is null or empty"))
+        } else if !self.ortcIsValidInput(channel as String) {
+            self.delegateExceptionCallback(self, error: self.generateError("Channel has invalid characters"))
+        } else if subscriberId != nil && !self.ortcIsValidInput(subscriberId!) {
+            self.delegateExceptionCallback(self, error: self.generateError("subscriberId has invalid characters"))
+        } else if self.subscribedChannels?.object(forKey: channel) != nil && (self.subscribedChannels?.object(forKey: channel) as! ChannelSubscription).isSubscribing == true {
+            self.delegateExceptionCallback(self, error: self.generateError("Already subscribing to the channel \'' + channel + '\''"))
+        } else if self.subscribedChannels?.object(forKey: channel) != nil && (self.subscribedChannels?.object(forKey: channel) as! ChannelSubscription).isSubscribed == true {
+            self.delegateExceptionCallback(self, error: self.generateError("Already subscribed to the channel \'' + channel + '\'"))
+        } else if channel.lengthOfBytes(using: String.Encoding.utf8) > MAX_CHANNEL_SIZE {
+            self.delegateExceptionCallback(self, error: self.generateError("Channel size exceeds the limit of ' + channelMaxSize + ' characters"))
+        }
+        else {
+            var _subscribeOnReconnected:Bool = false;
+            var _regId:String;
+            var _filter:String;
+            var _subscriberId:String = "";
+            
+            
+            if (subscribeOnReconnected == true) {
+                _subscribeOnReconnected = true;
+            }else{
+                _subscribeOnReconnected = false
+            }
+            
+            if(withNotifications == nil || OrtcClient.getDEVICE_TOKEN() == nil) {
+                _regId = "";
+            }else{
+                _regId = OrtcClient.getDEVICE_TOKEN()!
+            }
+            
+            if(filter == nil) {
+                _filter = "";
+            }else{
+                _filter = filter!
+            }
+            
+            if(subscriberId == nil) {
+                _subscriberId = "";
+            }else{
+                _subscriberId = subscriberId!
+            }
+            
+            var domainChannelCharacterIndex:[String] = (channel as! NSString).components(separatedBy: ":");
+            var channelToValidate:NSString = (channel as! NSString);
+            
+            if (domainChannelCharacterIndex.count > 0) {
+                channelToValidate = domainChannelCharacterIndex[0] as NSString;
+            }
+            
+            var hashPerm:NSString? = self.checkChannelPermissions(channel as NSString)
+            if (permissions == nil || (permissions != nil && hashPerm != nil)) {
+                if (subscribedChannels?.object(forKey: channel) == nil) {
+                    // Instantiate ChannelSubscription
+                    var channelSubscription:ChannelSubscription = ChannelSubscription()
+                    
+                    // Set channelSubscription properties
+                    channelSubscription.isSubscribing = true;
+                    channelSubscription.isSubscribed = false;
+                    channelSubscription.subscribeOnReconnected = _subscribeOnReconnected;
+                    channelSubscription.withOptions = true;
+                    channelSubscription.onMessageWithOptions = onMessageWithOptionsCallback;
+                    channelSubscription.subscriberId = _subscriberId;
+                    channelSubscription.regId = _regId;
+                    channelSubscription.withNotifications = (_regId == "" ? true : false);
+                    // Add to subscribed channels dictionary
+                    subscribedChannels!.setObject(channelSubscription, forKey: channel as NSCopying)
+                }
+                
+                var aString:String = "\"subscribeoptions;\(applicationKey!);\(authenticationToken!);\(channel);\(_subscriberId);\(_regId);\(PLATFORM);\(hashPerm);\(_filter)\""
+                
+                if (self.isEmpty(aString as AnyObject?) == false) {
+                    self.webSocket?.write(string: aString)
+                }
+            }
+        }
+    }
+    
+    
     
     
     /**
@@ -598,13 +891,13 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - return: TRUE if the authentication was successful or FALSE if it was not.
      */
     open func saveAuthentication(_ aUrl:String,
-                                   isCluster:Bool,
-                                   authenticationToken:String,
-                                   authenticationTokenIsPrivate:Bool,
-                                   applicationKey:String,
-                                   timeToLive:Int,
-                                   privateKey:String,
-                                   permissions:NSMutableDictionary?)->Bool{
+                                 isCluster:Bool,
+                                 authenticationToken:String,
+                                 authenticationTokenIsPrivate:Bool,
+                                 applicationKey:String,
+                                 timeToLive:Int,
+                                 privateKey:String,
+                                 permissions:NSMutableDictionary?)->Bool{
         /*
          * Sanity Checks.
          */
@@ -676,11 +969,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - parameter callback: Callback with error (NSError) and result (NSString) parameters
      */
     open func enablePresence(_ aUrl:String, isCluster:Bool,
-                               applicationKey:String,
-                               privateKey:String,
-                               channel:String,
-                               metadata:Bool,
-                               callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
+                             applicationKey:String,
+                             privateKey:String,
+                             channel:String,
+                             metadata:Bool,
+                             callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
         self.setPresence(true, aUrl: aUrl, isCluster: isCluster, applicationKey: applicationKey, privateKey: privateKey, channel: channel, metadata: metadata, callback: callback)
     }
     
@@ -695,11 +988,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      - parameter callback: Callback with error (NSError) and result (NSString) parameters
      */
     open func disablePresence(_ aUrl:String,
-                                isCluster:Bool,
-                                applicationKey:String,
-                                privateKey:String,
-                                channel:String,
-                                callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
+                              isCluster:Bool,
+                              applicationKey:String,
+                              privateKey:String,
+                              channel:String,
+                              callback:@escaping (_ error:NSError?, _ result:NSString?)->Void){
         self.setPresence(false, aUrl: aUrl, isCluster: isCluster, applicationKey: applicationKey, privateKey: privateKey, channel: channel, metadata: false, callback: callback)
     }
     
@@ -768,11 +1061,11 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      * - parameter callback: Callback with error (NSError) and result (NSDictionary) parameters
      */
     open func presence(_ aUrl:String,
-                         isCluster:Bool,
-                         applicationKey:String,
-                         authenticationToken:String,
-                         channel:String,
-                         callback:@escaping (_ error:NSError?, _ result:NSDictionary?)->Void){
+                       isCluster:Bool,
+                       applicationKey:String,
+                       authenticationToken:String,
+                       channel:String,
+                       callback:@escaping (_ error:NSError?, _ result:NSDictionary?)->Void){
         /*
          * Sanity Checks.
          */
@@ -807,6 +1100,22 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                 callback(error, nil)
             }
         }
+    }
+    
+    
+    /**
+     * Sets publish timeout.
+     * - parameter timeout: publish messages timeout.
+     */
+    open func setPublishTimeout(_ timeout:Double){
+        self.publishTimeout = timeout
+    }
+    
+    /**
+     * Returns publishTimeout: publish timeout.
+     */
+    open func getPublishTimeout() -> Double{
+        return self.publishTimeout!
     }
     
     /**
@@ -889,8 +1198,35 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     func receivedNotification(_ notification: Notification) {
         // [notification name] should be @"ApnsNotification" for received Apns Notififications
         if (notification.name.rawValue == "ApnsNotification") {
-            let userInfo:NSDictionary = (notification as NSNotification).userInfo! as NSDictionary
-            let ortcMessage: String = "a[\"{\\\"ch\\\":\\\"\(userInfo["C"] as! String)\\\",\\\"m\\\":\\\"\(userInfo["M"] as! String)\\\"}\"]"
+            var recRegex: NSRegularExpression?
+            
+            do{
+                recRegex = try NSRegularExpression(pattern: "^#(.*?):", options:NSRegularExpression.Options.caseInsensitive)
+            }catch{
+                
+            }
+            
+            let recMatch: NSTextCheckingResult? = recRegex?.firstMatch(in: notification.userInfo!["M"] as! String, options: NSRegularExpression.MatchingOptions.reportProgress, range: NSMakeRange(0, (notification.userInfo!["M"] as! NSString).length))
+            
+            var strRangeSeqId: NSRange?
+            if recMatch != nil{
+                strRangeSeqId = recMatch!.rangeAt(1)
+            }
+            var seqId:NSString?
+            var message:NSString?
+            if (recMatch != nil && strRangeSeqId?.location != NSNotFound) {
+                seqId = (notification.userInfo!["M"] as! NSString).substring(with: strRangeSeqId!) as NSString
+                let parts:[String] = (notification.userInfo!["M"] as! NSString).components(separatedBy: "#\(seqId!):")
+                message = parts[1] as NSString
+            }
+            
+            var ortcMessage: String
+            if seqId != nil && seqId != ""  {
+                ortcMessage = "a[\"{\\\"ch\\\":\\\"\(notification.userInfo!["C"] as! String)\\\",\\\"s\\\":\\\"\(seqId! as! String)\\\",\\\"m\\\":\\\"\(message! as! String)\\\"}\"]"
+            }else{
+                ortcMessage = "a[\"{\\\"ch\\\":\\\"\(notification.userInfo!["C"] as! String)\\\",\\\"m\\\":\\\"\(notification.userInfo!["M"] as! String)\\\"}\"]"
+            }
+
             self.parseReceivedMessage(ortcMessage as NSString?)
         }
         // [notification name] should be @"ApnsRegisterError" if an error ocured on RegisterForRemoteNotifications
@@ -912,8 +1248,9 @@ open class OrtcClient: NSObject, WebSocketDelegate {
             let hashPerm: String? = self.checkChannelPermissions(channel as NSString) as? String
             
             if self.permissions == nil || (self.permissions != nil && hashPerm != nil) {
+                
+                let channelSubscription:ChannelSubscription  = ChannelSubscription();
                 if self.subscribedChannels![channel] == nil {
-                    let channelSubscription:ChannelSubscription  = ChannelSubscription();
                     // Set channelSubscription properties
                     channelSubscription.isSubscribing = true
                     channelSubscription.isSubscribed = false
@@ -936,6 +1273,8 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                     }
                 } else if(withFilter){
                     aString = "\"subscribefilter;\(applicationKey!);\(authenticationToken!);\(channel);\(hashPerm);\(filter)\""
+                } else if channelSubscription.withOptions == true{
+                    aString = "\"subscribeoptions;\(applicationKey);\(authenticationToken);\(channel);\(channelSubscription.subscriberId);\(channelSubscription.regId);\(PLATFORM); \(hashPerm);\(filter)\""
                 } else {
                     aString = "\"subscribe;\(applicationKey!);\(authenticationToken!);\(channel);\(hashPerm)\""
                 }
@@ -1049,6 +1388,12 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                                     self.opException(arguments!)
                                 }
                                 break
+                            case opCodes.opAck.rawValue:
+                                if arguments != nil {
+                                    self.opAck(aMessage as! String)
+                                }
+                                break
+                                
                             default:
                                 self.delegateExceptionCallback(self, error: self.generateError("Unknown message received: \(aMessage!)"))
                                 break
@@ -1068,7 +1413,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     func processConnect(_ sender: AnyObject) {
         if stopReconnecting == false {
             balancer = (Balancer(cluster: self.clusterUrl as? String, serverUrl: self.url as? String, isCluster: self.isCluster!, appKey: self.applicationKey!,
-                callback:
+                                 callback:
                 { (aBalancerResponse: String?) in
                     
                     if self.isCluster != nil {
@@ -1340,6 +1685,30 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                                 aString = "\"subscribe;\(applicationKey!);\(authenticationToken!);\(channel.key);\(hashPerm)\"" as NSString
                                 
                             }
+                        } else if channelSubscription.withOptions == true{
+                            var _regId:String;
+                            var _filter:String;
+                            var _subscriberId:String = "";
+                            
+                            if(channelSubscription.regId == nil) {
+                                _regId = "";
+                            }else{
+                                _regId = channelSubscription.regId!
+                            }
+                            
+                            if(channelSubscription.filter == nil) {
+                                _filter = "";
+                            }else{
+                                _filter = channelSubscription.filter!
+                            }
+                            
+                            if(channelSubscription.subscriberId == nil) {
+                                _subscriberId = "";
+                            }else{
+                                _subscriberId = channelSubscription.subscriberId!
+                            }
+                            
+                            aString = "\"subscribeoptions;\(applicationKey!);\(authenticationToken!);\(channel.key);\(_subscriberId);\(_regId);\(PLATFORM);\(hashPerm);\(_filter)\"" as NSString
                             
                         } else if (channelSubscription.withFilter == true){
                             aString = "\"subscribefilter;\(applicationKey!);\(authenticationToken!);\(channel.key);\(hashPerm);\(channelSubscription.filter!)\"" as NSString
@@ -1360,8 +1729,8 @@ open class OrtcClient: NSObject, WebSocketDelegate {
                     self.subscribedChannels!.removeObject(forKey: channel)
                 }
                 // Clean messages buffer (can have lost message parts in memory)
-                messagesBuffer!.removeAllObjects()
-                OrtcClient.removeReceivedNotifications()
+                //messagesBuffer!.removeAllObjects()
+                //OrtcClient.removeReceivedNotifications()
                 self.delegateReconnectedCallback(self)
             } else {
                 hasConnectedFirstTime = true
@@ -1430,16 +1799,59 @@ open class OrtcClient: NSObject, WebSocketDelegate {
         
     }
     
+    
+    func opAck(_ message: String){
+        var unsubRegex: NSRegularExpression?
+        do{
+            unsubRegex = try NSRegularExpression(pattern: JSON_PATTERN, options: NSRegularExpression.Options.caseInsensitive)
+        }catch{
+            
+        }
+        let unsubMatch: NSTextCheckingResult? = unsubRegex?.firstMatch(in: message, options: NSRegularExpression.MatchingOptions.reportProgress, range: NSMakeRange(0, (message as NSString).length))
+        if unsubMatch != nil {
+            var msg: String?
+            let strRangeChn: NSRange? = unsubMatch!.rangeAt(1)
+            
+            if strRangeChn != nil {
+                msg = (message as NSString).substring(with: strRangeChn!)
+                msg = self.simulateJsonParse(msg! as NSString) as String
+            }
+            
+            if msg != nil {
+                var dictionary: [AnyHashable: Any]? = [AnyHashable: Any]()
+                do{
+                    dictionary = try JSONSerialization.jsonObject(with: msg!.data(using: String.Encoding.utf8)!, options: JSONSerialization.ReadingOptions.mutableContainers) as? [AnyHashable: Any]
+                    if dictionary?["m"] != nil && dictionary?["seq"] != nil {
+                        var msgId:String = dictionary!["m"] as! String
+                        var pendingMsg:NSDictionary = pendingPublishMessages!.object(forKey: msgId) as! NSDictionary
+                        var timer:Timer = pendingMsg.object(forKey: "timeout") as! Timer
+                        timer.invalidate()
+                        
+                        var callback:(NSError?,NSString?)->Void = pendingMsg.object(forKey: "callback") as! (NSError?,NSString?)->Void
+                        
+                        let seq:NSString = (dictionary?["seq"] as? NSString)!
+                        callback(nil, seq)
+                        pendingPublishMessages?.removeObject(forKey: msgId)
+                    }
+                }catch{
+                    
+                }
+            }
+            
+        }
+    }
+    
     func opException(_ message: String) {
         var exRegex: NSRegularExpression?
         
         do{
-            exRegex = try NSRegularExpression(pattern: EXCEPTION_PATTERN, options:NSRegularExpression.Options.caseInsensitive)
+            exRegex = try NSRegularExpression(pattern: JSON_PATTERN, options:NSRegularExpression.Options.caseInsensitive)
         }catch{
             return
         }
         
         let exMatch: NSTextCheckingResult? = exRegex?.firstMatch(in: message, options: NSRegularExpression.MatchingOptions.reportProgress, range: NSMakeRange(0, (message as NSString).length))!
+        
         if exMatch != nil {
             var operation: String?
             var channel: String?
@@ -1503,204 +1915,168 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     }
     
     func opReceive(_ message: String) {
+        
+        var originalMessage:String = String(message)
         var recRegex: NSRegularExpression?
         var recRegexFiltered: NSRegularExpression?
         
         do{
-            recRegex = try NSRegularExpression(pattern: RECEIVED_PATTERN, options:NSRegularExpression.Options.caseInsensitive)
-        }catch{
-            
-        }
-        
-        do{
-            recRegexFiltered = try NSRegularExpression(pattern: RECEIVED_PATTERN_FILTERED, options:NSRegularExpression.Options.caseInsensitive)
+            recRegex = try NSRegularExpression(pattern: JSON_PATTERN, options:NSRegularExpression.Options.caseInsensitive)
         }catch{
             
         }
         
         let recMatch: NSTextCheckingResult? = recRegex?.firstMatch(in: message, options: NSRegularExpression.MatchingOptions.reportProgress, range: NSMakeRange(0, (message as NSString).length))
-        let recMatchFiltered: NSTextCheckingResult? = recRegexFiltered?.firstMatch(in: message, options: NSRegularExpression.MatchingOptions.reportProgress, range: NSMakeRange(0, (message as NSString).length))
         
         if recMatch != nil{
-            var aChannel: String?
+            var jsonMessage: String?
             var aMessage: String?
-            let strRangeChn: NSRange? = recMatch!.rangeAt(1)
-            let strRangeMsg: NSRange? = recMatch!.rangeAt(2)
-            if strRangeChn != nil {
-                aChannel = (message as NSString).substring(with: strRangeChn!)
-            }
-            if strRangeMsg != nil {
-                aMessage = (message as NSString).substring(with: strRangeMsg!)
-            }
-            if aChannel != nil && aMessage != nil {
-                
-                var msgRegex: NSRegularExpression?
-                do{
-                    msgRegex = try NSRegularExpression(pattern: MULTI_PART_MESSAGE_PATTERN, options:NSRegularExpression.Options.caseInsensitive)
-                }catch{
-                    
-                }
-                let multiMatch: NSTextCheckingResult? = msgRegex!.firstMatch(in: aMessage!, options: NSRegularExpression.MatchingOptions.reportProgress, range: NSMakeRange(0, (aMessage! as NSString).length))
-                var messageId: String = ""
-                var messageCurrentPart: Int32 = 1
-                var messageTotalPart: Int32 = 1
-                var lastPart: Bool = false
-                if multiMatch != nil {
-                    let strRangeMsgId: NSRange? = multiMatch!.rangeAt(1)
-                    let strRangeMsgCurPart: NSRange? = multiMatch!.rangeAt(2)
-                    let strRangeMsgTotPart: NSRange? = multiMatch!.rangeAt(3)
-                    let strRangeMsgRec: NSRange? = multiMatch!.rangeAt(4)
-                    if strRangeMsgId != nil {
-                        messageId = (aMessage! as NSString).substring(with: strRangeMsgId!)
-                    }
-                    if strRangeMsgCurPart != nil {
-                        messageCurrentPart = ((aMessage! as NSString).substring(with: strRangeMsgCurPart!) as NSString).intValue
-                    }
-                    if strRangeMsgTotPart != nil {
-                        messageTotalPart = ((aMessage! as NSString).substring(with: strRangeMsgTotPart!) as NSString).intValue
-                    }
-                    if strRangeMsgRec != nil {
-                        aMessage = (aMessage! as NSString).substring(with: strRangeMsgRec!)
-                        //code below written by Rafa, gives a bug for a meesage containing % character
-                        //aMessage = [[aMessage substringWithRange:strRangeMsgRec] stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
-                    }
-                }
-                // Is a message part
-                if self.isEmpty(messageId as AnyObject?) == false {
-                    if messagesBuffer?.object(forKey: messageId) == nil {
-                        let msgSentDict: NSMutableDictionary = NSMutableDictionary()
-                        msgSentDict["isMsgSent"] = NSNumber(value: false as Bool)
-                        messagesBuffer?.setObject(msgSentDict, forKey: messageId as NSCopying)
-                    }
-                    let messageBufferId: NSMutableDictionary? = messagesBuffer?.object(forKey: messageId) as? NSMutableDictionary
-                    messageBufferId?.setObject(aMessage!, forKey: "\(messageCurrentPart)" as NSCopying)
-                    
-                    if messageTotalPart == Int32(messageBufferId!.allKeys.count - 1) {
-                        lastPart = true
-                    }
-                } else {
-                    lastPart = true
-                    
-                }
-                if lastPart {
-                    if !self.isEmpty(messageId as AnyObject?) {
-                        aMessage = ""
-                        let messageBufferId: NSMutableDictionary? = messagesBuffer?.object(forKey: messageId) as? NSMutableDictionary
-                        for i in 1...messageTotalPart {
-                            let messagePart: String? = messageBufferId?.object(forKey: "\(i)") as? String
-                            aMessage = aMessage! + messagePart!
-                            // Delete from messages buffer
-                            messageBufferId!.removeObject(forKey: "\(i)")
-                        }
-                    }
-                    
-                    if messagesBuffer?.object(forKey: messageId) != nil &&
-                        ((messagesBuffer?.object(forKey: messageId) as! NSDictionary).object(forKey: "isMsgSent") as! Bool) == true {
-                        messagesBuffer?.removeObject(forKey: messageId)
-                    } else if self.subscribedChannels!.object(forKey: aChannel!) != nil {
-                        let channelSubscription:ChannelSubscription? = self.subscribedChannels!.object(forKey: aChannel!) as? ChannelSubscription
-                        if !self.isEmpty(messageId as AnyObject?) {
-                            let msgSentDict: NSMutableDictionary? = messagesBuffer?.object(forKey: messageId) as? NSMutableDictionary
-                            msgSentDict?.setObject(NSNumber(value: true as Bool), forKey: "isMsgSent" as NSCopying)
-                            messagesBuffer?.setObject(msgSentDict!, forKey: messageId as NSCopying)
-                        }
-                        aMessage = self.escapeRecvChars(aMessage! as NSString) as String
-                        aMessage = self.checkForEmoji(aMessage! as NSString) as String
-                        channelSubscription!.onMessage!(self, aChannel!, aMessage!)
-                    }
-                }
-            }
-        } else if(recMatchFiltered != nil){
             var aChannel: String?
-            var aMessage: String?
-            var aFiltered: NSString?
+            var aFiltered: Bool?
+            var aSeqId: String?
             
-            let strRangeChn: NSRange? = recMatchFiltered!.rangeAt(1)
-            let strRangeFiltered: NSRange? = recMatchFiltered!.rangeAt(2)
-            let strRangeMsg: NSRange? = recMatchFiltered!.rangeAt(3)
-            if strRangeChn != nil {
-                aChannel = (message as NSString).substring(with: strRangeChn!)
+            
+            let strRangeJSON: NSRange? = recMatch!.rangeAt(1)
+            if strRangeJSON != nil {
+                jsonMessage = (message as NSString).substring(with: strRangeJSON!)
+                jsonMessage = self.simulateJsonParse(jsonMessage! as NSString) as String
             }
-            if strRangeFiltered != nil {
-                aFiltered = (message as NSString).substring(with: strRangeFiltered!) as NSString?
-            }
-            if strRangeMsg != nil {
-                aMessage = (message as NSString).substring(with: strRangeMsg!)
-            }
-            if aChannel != nil && aMessage != nil && aFiltered != nil {
+            
+            var json: [AnyHashable: Any]? = [AnyHashable: Any]()
+            do{
+                json = try JSONSerialization.jsonObject(with: jsonMessage!.data(using: String.Encoding.utf8)!, options: JSONSerialization.ReadingOptions.mutableContainers) as? [AnyHashable: Any]
+            }catch{
                 
-                var msgRegex: NSRegularExpression?
-                do{
-                    msgRegex = try NSRegularExpression(pattern: MULTI_PART_MESSAGE_PATTERN, options:NSRegularExpression.Options.caseInsensitive)
-                }catch{
-                    
+            }
+            if json != nil{
+                
+                if json?["ch"] != nil {
+                    aChannel = json!["ch"] as! String
                 }
-                let multiMatch: NSTextCheckingResult? = msgRegex!.firstMatch(in: aMessage!, options: NSRegularExpression.MatchingOptions.reportProgress, range: NSMakeRange(0, (aMessage! as NSString).length))
-                var messageId: String = ""
-                var messageCurrentPart: Int32 = 1
-                var messageTotalPart: Int32 = 1
-                var lastPart: Bool = false
-                if multiMatch != nil {
-                    let strRangeMsgId: NSRange? = multiMatch!.rangeAt(1)
-                    let strRangeMsgCurPart: NSRange? = multiMatch!.rangeAt(2)
-                    let strRangeMsgTotPart: NSRange? = multiMatch!.rangeAt(3)
-                    let strRangeMsgRec: NSRange? = multiMatch!.rangeAt(4)
-                    if strRangeMsgId != nil {
-                        messageId = (aMessage! as NSString).substring(with: strRangeMsgId!)
-                    }
-                    if strRangeMsgCurPart != nil {
-                        messageCurrentPart = ((aMessage! as NSString).substring(with: strRangeMsgCurPart!) as NSString).intValue
-                    }
-                    if strRangeMsgTotPart != nil {
-                        messageTotalPart = ((aMessage! as NSString).substring(with: strRangeMsgTotPart!) as NSString).intValue
-                    }
-                    if strRangeMsgRec != nil {
-                        aMessage = (aMessage! as NSString).substring(with: strRangeMsgRec!)
-                        //code below written by Rafa, gives a bug for a meesage containing % character
-                        //aMessage = [[aMessage substringWithRange:strRangeMsgRec] stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
-                    }
+                
+                if json?["m"] != nil {
+                    aMessage = json!["m"] as! String
                 }
-                // Is a message part
-                if self.isEmpty(messageId as AnyObject?) == false {
-                    if messagesBuffer?.object(forKey: messageId) == nil {
-                        let msgSentDict: NSMutableDictionary = NSMutableDictionary()
-                        msgSentDict["isMsgSent"] = NSNumber(value: false as Bool)
-                        messagesBuffer?.setObject(msgSentDict, forKey: messageId as NSCopying)
-                    }
-                    let messageBufferId: NSMutableDictionary? = messagesBuffer?.object(forKey: messageId) as? NSMutableDictionary
-                    messageBufferId?.setObject(aMessage!, forKey: "\(messageCurrentPart)" as NSCopying)
-                    
-                    if messageTotalPart == Int32(messageBufferId!.allKeys.count - 1) {
-                        lastPart = true
-                    }
-                } else {
-                    lastPart = true
-                    
+                
+                if json?["f"] != nil {
+                    aFiltered = json!["f"] as! Bool
                 }
-                if lastPart {
-                    if !self.isEmpty(messageId as AnyObject?) {
-                        aMessage = ""
+                
+                if json?["s"] != nil {
+                    aSeqId = json!["s"] as! String
+                }
+                
+                if aChannel != nil && aMessage != nil {
+                    
+                    var msgRegex: NSRegularExpression?
+                    do{
+                        msgRegex = try NSRegularExpression(pattern: MULTI_PART_MESSAGE_PATTERN, options:NSRegularExpression.Options.caseInsensitive)
+                    }catch{
+                        
+                    }
+                    let multiMatch: NSTextCheckingResult? = msgRegex!.firstMatch(in: aMessage!, options: NSRegularExpression.MatchingOptions.reportProgress, range: NSMakeRange(0, (aMessage! as NSString).length))
+                    var messageId: String = ""
+                    var messageCurrentPart: Int32 = 1
+                    var messageTotalPart: Int32 = 1
+                    var lastPart: Bool = false
+                    if multiMatch != nil {
+                        let strRangeMsgId: NSRange? = multiMatch!.rangeAt(1)
+                        let strRangeMsgCurPart: NSRange? = multiMatch!.rangeAt(2)
+                        let strRangeMsgTotPart: NSRange? = multiMatch!.rangeAt(3)
+                        let strRangeMsgRec: NSRange? = multiMatch!.rangeAt(4)
+                        if strRangeMsgId != nil {
+                            messageId = (aMessage! as NSString).substring(with: strRangeMsgId!)
+                        }
+                        if strRangeMsgCurPart != nil {
+                            messageCurrentPart = ((aMessage! as NSString).substring(with: strRangeMsgCurPart!) as NSString).intValue
+                        }
+                        if strRangeMsgTotPart != nil {
+                            messageTotalPart = ((aMessage! as NSString).substring(with: strRangeMsgTotPart!) as NSString).intValue
+                        }
+                        if strRangeMsgRec != nil {
+                            aMessage = (aMessage! as NSString).substring(with: strRangeMsgRec!)
+                            //code below written by Rafa, gives a bug for a meesage containing % character
+                            //aMessage = [[aMessage substringWithRange:strRangeMsgRec] stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
+                        }
+                    }
+                    // Is a message part
+                    if self.isEmpty(messageId as AnyObject?) == false {
+                        if messagesBuffer?.object(forKey: messageId) == nil {
+                            let msgSentDict: NSMutableDictionary = NSMutableDictionary()
+                            msgSentDict["isMsgSent"] = NSNumber(value: false as Bool)
+                            messagesBuffer?.setObject(msgSentDict, forKey: messageId as NSCopying)
+                        }
                         let messageBufferId: NSMutableDictionary? = messagesBuffer?.object(forKey: messageId) as? NSMutableDictionary
-                        for i in 1...messageTotalPart {
-                            let messagePart: String? = messageBufferId?.object(forKey: "\(i)") as? String
-                            aMessage = aMessage! + messagePart!
-                            // Delete from messages buffer
-                            messageBufferId!.removeObject(forKey: "\(i)")
+                        messageBufferId?.setObject(aMessage!, forKey: "\(messageCurrentPart)" as NSCopying)
+                        
+                        if messageTotalPart == Int32(messageBufferId!.allKeys.count - 1) {
+                            lastPart = true
+                        }
+                    } else {
+                        lastPart = true
+                        
+                    }
+                    if lastPart {
+                        if !self.isEmpty(messageId as AnyObject?) {
+                            aMessage = ""
+                            let messageBufferId: NSMutableDictionary? = messagesBuffer?.object(forKey: messageId) as? NSMutableDictionary
+                            for i in 1...messageTotalPart {
+                                let messagePart: String? = messageBufferId?.object(forKey: "\(i)") as? String
+                                aMessage = aMessage! + messagePart!
+                                // Delete from messages buffer
+                                messageBufferId!.removeObject(forKey: "\(i)")
+                            }
+                        }
+                        
+                        if messagesBuffer?.object(forKey: messageId) != nil &&
+                            ((messagesBuffer?.object(forKey: messageId) as! NSDictionary).object(forKey: "isMsgSent") as! Bool) == true {
+                            messagesBuffer?.removeObject(forKey: messageId)
+                        } else if self.subscribedChannels!.object(forKey: aChannel!) != nil {
+                            let channelSubscription:ChannelSubscription? = self.subscribedChannels!.object(forKey: aChannel!) as? ChannelSubscription
+                            if !self.isEmpty(messageId as AnyObject?) {
+                                let msgSentDict: NSMutableDictionary? = messagesBuffer?.object(forKey: messageId) as? NSMutableDictionary
+                                msgSentDict?.setObject(NSNumber(value: true as Bool), forKey: "isMsgSent" as NSCopying)
+                                messagesBuffer?.setObject(msgSentDict!, forKey: messageId as NSCopying)
+                            }
+                            //aMessage = self.escapeRecvChars(aMessage! as NSString) as String
+                            
+                            aMessage = self.checkForEmoji(aMessage! as NSString) as String
+                            var callbackCalled:Bool = false
+                            
+                            if self.deliveredNotification(originalMessage, self.applicationKey!) == true {
+                                return;
+                            }
+                            
+                            if channelSubscription?.withFilter == true {
+                                channelSubscription?.onMessageWithFilter!(self, aChannel!, aFiltered!, aMessage!)
+                                callbackCalled = true
+                            }else if channelSubscription?.withOptions == true{
+                                var dataResult: NSMutableDictionary = NSMutableDictionary()
+                                dataResult.setObject(aChannel!, forKey: "channel" as NSCopying)
+                                dataResult.setObject(aMessage!, forKey: "message" as NSCopying)
+                                if aFiltered != nil {
+                                    dataResult.setObject(aFiltered!, forKey: "filter" as NSCopying)
+                                }
+                                if aSeqId != nil {
+                                    dataResult.setObject(aSeqId!, forKey: "seqId" as NSCopying)
+                                }
+                                channelSubscription?.onMessageWithOptions!(self, dataResult)
+                                callbackCalled = true
+                            }else if channelSubscription?.onMessage != nil{
+                                channelSubscription!.onMessage!(self, aChannel!, aMessage!)
+                                callbackCalled = true
+                            }
+                            
+                            if callbackCalled == true {
+                                self.storeNotification(originalMessage, self.applicationKey!)
+                            }
                         }
                     }
-                    if messagesBuffer?.object(forKey: messageId) != nil &&
-                        ((messagesBuffer?.object(forKey: messageId) as AnyObject).object(forKey: "isMsgSent") as AnyObject).boolValue == true {
-                        messagesBuffer?.removeObject(forKey: messageId)
-                    } else if self.subscribedChannels!.object(forKey: aChannel!) != nil {
-                        let channelSubscription:ChannelSubscription? = self.subscribedChannels!.object(forKey: aChannel!) as? ChannelSubscription
-                        if !self.isEmpty(messageId as AnyObject?) {
-                            let msgSentDict: NSMutableDictionary? = messagesBuffer?.object(forKey: messageId) as? NSMutableDictionary
-                            msgSentDict?.setObject(NSNumber(value: true as Bool), forKey: "isMsgSent" as NSCopying)
-                            messagesBuffer?.setObject(msgSentDict!, forKey: messageId as NSCopying)
-                        }
-                        aMessage = self.escapeRecvChars(aMessage! as NSString) as String
-                        aMessage = self.checkForEmoji(aMessage! as NSString) as String
-                        channelSubscription!.onMessageWithFilter!(self, aChannel!, aFiltered!.boolValue, aMessage!)
+                    
+                    if(messageId != nil && aSeqId != nil){
+                        let haveAllParts: String = lastPart ? "1":"0"
+                        let ack: String = "\"ack;\(applicationKey!);\(aChannel!);\(messageId);\(aSeqId!);\(haveAllParts)\""
+                        self.webSocket?.write(string: ack)
                     }
                 }
             }
@@ -1873,23 +2249,121 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     func parseReceivedNotifications(){
         
         if UserDefaults.standard.object(forKey: NOTIFICATIONS_KEY) != nil{
-            let notificationsDict: NSMutableDictionary? = NSMutableDictionary(dictionary: UserDefaults.standard.object(forKey: NOTIFICATIONS_KEY) as! NSDictionary)
-            
-            if notificationsDict != nil && notificationsDict?.object(forKey: applicationKey!) != nil{
-                
-                let receivedMessages: NSMutableArray? = NSMutableArray(array: notificationsDict?.object(forKey: applicationKey!) as! NSArray)
-                let receivedMCopy: NSMutableArray? = NSMutableArray(array:receivedMessages!)
-                
-                for message in receivedMCopy! {
-                    self.parseReceivedMessage(message as? NSString)
-                }
-                receivedMessages!.removeAllObjects()
-                notificationsDict!.setObject(receivedMessages!, forKey: applicationKey! as NSCopying)
-                UserDefaults.standard.set(notificationsDict!, forKey: NOTIFICATIONS_KEY)
-                UserDefaults.standard.synchronize()
+            var notificationsDict: NSMutableDictionary?
+            if UserDefaults.standard.object(forKey: NOTIFICATIONS_KEY) != nil{
+                notificationsDict = NSMutableDictionary(dictionary: UserDefaults.standard.object(forKey: NOTIFICATIONS_KEY) as! NSDictionary)
             }
+            if notificationsDict == nil {
+                notificationsDict = NSMutableDictionary()
+            }
+            
+            var notificationsArray: NSMutableDictionary?
+            
+            if notificationsDict?.object(forKey: applicationKey!) != nil{
+                notificationsArray = NSMutableDictionary(dictionary: notificationsDict?.object(forKey: applicationKey!) as! NSMutableDictionary)
+            }
+            
+            if notificationsArray != nil{
+                for message in notificationsArray!.allKeys {
+                    self.parseReceivedMessage(message as! NSString)
+                }
+            }
+            
+            notificationsArray = NSMutableDictionary()
+            
+            notificationsArray?.removeAllObjects()
+            notificationsDict!.setObject(notificationsArray!, forKey: (applicationKey! as! NSCopying))
+            UserDefaults.standard.set(notificationsDict!, forKey: NOTIFICATIONS_KEY)
+            UserDefaults.standard.synchronize()
         }
     }
+    
+    func deliveredNotification(_ ortcMessage:String, _ withAppKey:String) -> Bool{
+        var notificationsDict: NSMutableDictionary?
+        if UserDefaults.standard.object(forKey: NOTIFICATIONS_KEY) != nil{
+            notificationsDict = NSMutableDictionary(dictionary: UserDefaults.standard.object(forKey: NOTIFICATIONS_KEY) as! NSDictionary)
+        }
+        if notificationsDict == nil {
+            notificationsDict = NSMutableDictionary()
+        }
+        
+        var notificationsArray: NSMutableDictionary?
+        
+        if notificationsDict?.object(forKey: applicationKey!) != nil{
+            notificationsArray = NSMutableDictionary(dictionary: notificationsDict?.object(forKey: applicationKey!) as! NSMutableDictionary)
+        }
+        
+        if notificationsArray == nil{
+            notificationsArray = NSMutableDictionary()
+        }
+        
+        
+        let delivered:Bool? = (notificationsArray?.object(forKey: ortcMessage) as? Bool)
+        
+        if delivered != nil && delivered == true{
+            return true
+        }
+        
+        return false
+    }
+    
+    
+    func storeNotification(_ ortcMessage:String, _ withAppKey:String){
+        var notificationsDict: NSMutableDictionary?
+        if UserDefaults.standard.object(forKey: NOTIFICATIONS_KEY) != nil{
+            notificationsDict = NSMutableDictionary(dictionary: UserDefaults.standard.object(forKey: NOTIFICATIONS_KEY) as! NSDictionary)
+        }
+        if notificationsDict == nil {
+            notificationsDict = NSMutableDictionary()
+        }
+        
+        var notificationsArray: NSMutableDictionary?
+        
+        if notificationsDict?.object(forKey: applicationKey!) != nil{
+            notificationsArray = NSMutableDictionary(dictionary: notificationsDict?.object(forKey: applicationKey!) as! NSMutableDictionary)
+        }
+        
+        if notificationsArray == nil{
+            notificationsArray = NSMutableDictionary()
+        }
+        
+        notificationsArray!.setObject(true, forKey: ortcMessage as NSCopying)
+        notificationsDict!.setObject(notificationsArray!, forKey: (applicationKey! as! NSCopying))
+        UserDefaults.standard.set(notificationsDict!, forKey: NOTIFICATIONS_KEY)
+        UserDefaults.standard.synchronize()
+    }
+    
+    
+    func removeNotification(message:String){
+        var notificationsDict: NSMutableDictionary?
+        if UserDefaults.standard.object(forKey: NOTIFICATIONS_KEY) != nil{
+            notificationsDict = NSMutableDictionary(dictionary: UserDefaults.standard.object(forKey: NOTIFICATIONS_KEY) as! NSDictionary)
+        }
+        if notificationsDict == nil {
+            notificationsDict = NSMutableDictionary()
+        }
+        
+        var notificationsArray: NSMutableDictionary?
+        
+        if notificationsDict?.object(forKey: applicationKey!) != nil{
+            notificationsArray = NSMutableDictionary(dictionary: notificationsDict?.object(forKey: applicationKey!) as! NSMutableDictionary)
+        }
+        
+        if notificationsArray == nil{
+            notificationsArray = NSMutableDictionary()
+        }
+        
+        for notification in notificationsArray! {
+            if message == (notification as! String) {
+                notificationsArray?.removeObject(forKey: notification)
+            }
+        }
+        
+        notificationsDict!.setObject(notificationsArray!, forKey: (applicationKey! as! NSCopying))
+        UserDefaults.standard.set(notificationsDict!, forKey: NOTIFICATIONS_KEY)
+        UserDefaults.standard.synchronize()
+    }
+    
     
     func delegateConnectedCallback(_ ortc: OrtcClient) {
         self.ortcDelegate?.onConnected(ortc)
@@ -1934,8 +2408,12 @@ class ChannelSubscription: NSObject {
     var withNotifications: Bool?
     var withFilter: Bool?
     var filter:String?
+    var withOptions:Bool?
+    var regId:String?;
+    var subscriberId:String?;
     var onMessage: ((_ ortc:OrtcClient, _ channel:String, _ message:String)->Void?)?
     var onMessageWithFilter: ((_ ortc:OrtcClient, _ channel:String, _ filtered:Bool, _ message:String)->Void?)?
+    var onMessageWithOptions: ((_ ortc:OrtcClient, _ msgOptions: NSDictionary)->Void?)?
     
     override init() {
         super.init()
