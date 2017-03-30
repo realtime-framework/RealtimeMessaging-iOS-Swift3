@@ -310,7 +310,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
     open func connect(_ applicationKey:NSString?, authenticationToken:NSString?){
         if isConnected == true {
             self.delegateExceptionCallback(self, error: self.generateError("Already connected"))
-        } else if self.url != nil && self.clusterUrl != nil {
+        } else if self.url == nil && self.clusterUrl == nil {
             self.delegateExceptionCallback(self, error: self.generateError("URL and Cluster URL are null or empty"))
         } else if applicationKey == nil {
             self.delegateExceptionCallback(self, error: self.generateError("Application Key is null or empty"))
@@ -610,8 +610,7 @@ open class OrtcClient: NSObject, WebSocketDelegate {
      *      <code>options = {<br>
      * &nbsp;&nbsp;&nbsp;&nbsp; channel,<br>
      * &nbsp;&nbsp;&nbsp;&nbsp; subscribeOnReconnected, // optional, default = true<br>
-     * &nbsp;&nbsp;&nbsp;&nbsp; regId, // optional, default = "", device token for push notifications as in                 subscribeWithNotifications<br>
-     * &nbsp;&nbsp;&nbsp;&nbsp; pushPlatform, // optional, default = "", push notifications platform as in  subscribeWithNotifications<br>
+     * &nbsp;&nbsp;&nbsp;&nbsp; withNotifications (Bool), // optional, default = false, push notifications as in subscribeWithNotifications<br>
      * &nbsp;&nbsp;&nbsp;&nbsp; filter, // optional, default = "", the subscription filter as in subscribeWithFilter<br>
      * &nbsp;&nbsp;&nbsp;&nbsp; subscriberId // optional, default = "", the subscriberId as in subscribeWithBuffer<br>
      *      }<br></code>
